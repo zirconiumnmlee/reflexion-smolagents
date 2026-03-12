@@ -1804,6 +1804,427 @@ class CodeAgent(MultiStepAgent):
         return super().from_dict(agent_dict, **code_agent_kwargs)
 
 
+class ReflexionAgent(MultiStepAgent):
+    """
+    This agent is an extension of the CodeAgent, with reflexion capability to learn from error. 
+
+    Args:
+        tools (`list[Tool]`): [`Tool`]s that the agent can use.
+        model (`Model`): Model that will generate the agent's actions.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
+        additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
+        planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
+        executor ([`PythonExecutor`], *optional*): Custom Python code executor. If not provided, a default executor will be created based on `executor_type`.
+        executor_type (`Literal["local", "blaxel", "e2b", "modal", "docker", "wasm"]`, default `"local"`): Type of code executor.
+        executor_kwargs (`dict`, *optional*): Additional arguments to pass to initialize the executor.
+        max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
+        stream_outputs (`bool`, *optional*, default `False`): Whether to stream outputs during execution.
+        use_structured_outputs_internally (`bool`, default `False`): Whether to use structured generation at each action step: improves performance for many models.
+
+            <Added version="1.17.0"/>
+        code_block_tags (`tuple[str, str]` | `Literal["markdown"]`, *optional*): Opening and closing tags for code blocks (regex strings). Pass a custom tuple, or pass 'markdown' to use ("```(?:python|py)", "\\n```"), leave empty to use ("<code>", "</code>").
+        **kwargs: Additional keyword arguments.
+    """
+
+    def __init__(
+        self,
+        tools: list[Tool],
+        model: Model,
+        prompt_templates: PromptTemplates | None = None,
+        additional_authorized_imports: list[str] | None = None,
+        planning_interval: int | None = None,
+        executor: PythonExecutor = None,
+        executor_type: Literal["local", "blaxel", "e2b", "modal", "docker", "wasm"] = "local",
+        executor_kwargs: dict[str, Any] | None = None,
+        max_print_outputs_length: int | None = None,
+        stream_outputs: bool = False,
+        use_structured_outputs_internally: bool = False,
+        code_block_tags: str | tuple[str, str] | None = None,
+        **kwargs,
+    ):
+        self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
+        self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
+        self.max_print_outputs_length = max_print_outputs_length
+        self._use_structured_outputs_internally = use_structured_outputs_internally
+        if self._use_structured_outputs_internally:
+            prompt_templates = prompt_templates or yaml.safe_load(
+                importlib.resources.files("smolagents.prompts").joinpath("structured_code_agent.yaml").read_text()##modify
+            )
+        else:
+            prompt_templates = prompt_templates or yaml.safe_load(
+                importlib.resources.files("smolagents.prompts").joinpath("code_agent.yaml").read_text()##modify
+            )
+
+        if isinstance(code_block_tags, str) and not code_block_tags == "markdown":
+            raise ValueError("Only 'markdown' is supported for a string argument to `code_block_tags`.")
+        self.code_block_tags = (
+            code_block_tags
+            if isinstance(code_block_tags, tuple)
+            else ("```python", "```")
+            if code_block_tags == "markdown"
+            else ("<code>", "</code>")
+        )
+
+        super().__init__(
+            tools=tools,
+            model=model,
+            prompt_templates=prompt_templates,
+            planning_interval=planning_interval,
+            **kwargs,
+        )
+        self.stream_outputs = stream_outputs
+        if self.stream_outputs and not hasattr(self.model, "generate_stream"):
+            raise ValueError(
+                "`stream_outputs` is set to True, but the model class implements no `generate_stream` method."
+            )
+        if "*" in self.additional_authorized_imports:
+            self.logger.log(
+                "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
+                level=LogLevel.INFO,
+            )
+        self.executor_type = executor_type
+        self.executor_kwargs: dict[str, Any] = executor_kwargs or {}
+        self.python_executor = executor or self.create_python_executor()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources used by the agent, such as the remote Python executor."""
+        if hasattr(self.python_executor, "cleanup"):
+            self.python_executor.cleanup()
+
+    def create_python_executor(self) -> PythonExecutor:
+        if self.executor_type not in {"local", "blaxel", "e2b", "modal", "docker", "wasm"}:
+            raise ValueError(f"Unsupported executor type: {self.executor_type}")
+
+        if self.executor_type == "local":
+            return LocalPythonExecutor(
+                self.additional_authorized_imports,
+                **{"max_print_outputs_length": self.max_print_outputs_length} | self.executor_kwargs,
+            )
+        else:
+            if self.managed_agents:
+                raise Exception("Managed agents are not yet supported with remote code execution.")
+            remote_executors = {
+                "blaxel": BlaxelExecutor,
+                "e2b": E2BExecutor,
+                "docker": DockerExecutor,
+                "wasm": WasmExecutor,
+                "modal": ModalExecutor,
+            }
+            return remote_executors[self.executor_type](
+                self.additional_authorized_imports, self.logger, **self.executor_kwargs
+            )
+
+    def initialize_system_prompt(self) -> str:
+        system_prompt = populate_template(
+            self.prompt_templates["system_prompt"],
+            variables={
+                "tools": self.tools,
+                "managed_agents": self.managed_agents,
+                "authorized_imports": (
+                    "You can import from any package you want."
+                    if "*" in self.authorized_imports
+                    else str(self.authorized_imports)
+                ),
+                "custom_instructions": self.instructions,
+                "code_block_opening_tag": self.code_block_tags[0],
+                "code_block_closing_tag": self.code_block_tags[1],
+                "reflection": "",
+            },
+        )
+        return system_prompt
+    
+    def update_system_prompt(self, reflection_memory: list) -> str:
+        system_prompt = populate_template(
+            self.prompt_templates["system_prompt"],
+            variables={
+                "tools": self.tools,
+                "managed_agents": self.managed_agents,
+                "authorized_imports": (
+                    "You can import from any package you want."
+                    if "*" in self.authorized_imports
+                    else str(self.authorized_imports)
+                ),
+                "custom_instructions": self.instructions,
+                "code_block_opening_tag": self.code_block_tags[0],
+                "code_block_closing_tag": self.code_block_tags[1],
+                "reflection": "\n".join(reflection_memory),
+            },
+        )
+        return system_prompt
+
+    ##modify
+    def run(
+        self,
+        task: str,
+        stream: bool = False,
+        reset: bool = True,
+        images: list["PIL.Image.Image"] | None = None,
+        additional_args: dict | None = None,
+        max_steps: int | None = None,
+        return_full_result: bool | None = None,
+        trials: int = 5,
+    ) -> Any | RunResult:
+        """
+        Run the agent for the given task with reflexion
+
+        Args:
+            task (`str`): Task to perform.
+            stream (`bool`): Whether to run in streaming mode.
+                If `True`, returns a generator that yields each step as it is executed. You must iterate over this generator to process the individual steps (e.g., using a for loop or `next()`).
+                If `False`, executes all steps internally and returns only the final answer after completion.
+            reset (`bool`): Whether to reset the conversation or keep it going from previous run.
+            images (`list[PIL.Image.Image]`, *optional*): Image(s) objects.
+            additional_args (`dict`, *optional*): Any other variables that you want to pass to the agent run, for instance images or dataframes. Give them clear names!
+            max_steps (`int`, *optional*): Maximum number of steps the agent can take to solve the task. if not provided, will use the agent's default value.
+            return_full_result (`bool`, *optional*): Whether to return the full [`RunResult`] object or just the final answer output.
+                If `None` (default), the agent's `self.return_full_result` setting is used.
+
+        Example:
+        ```py
+        from smolagents import CodeAgent
+        agent = CodeAgent(tools=[])
+        agent.run("What is the result of 2 power 3.7384?")
+        ```
+        """
+        result_list = []
+        reflection_mem = []
+        step_dicts = []
+
+        t = 0
+        run_start_time = time.time()
+
+        while True:  # do-while style loop
+
+            if t > 0:
+                self.update_system_prompt(reflection_mem)
+
+            result = super().run(
+                task=task,
+                stream=stream,
+                reset=reset,
+                images=images,
+                additional_args=additional_args,
+                max_steps=max_steps,
+                return_full_result=True,
+            )
+
+            result_list.append(result)
+
+            trajectory = result.steps
+
+            is_pass, reward = evaluator(trajectory)
+
+            sr = self_reflection(trajectory, reward)
+            reflection_mem.append(sr)
+
+            self.memory.reset()
+            step_dicts.extend(self.memory.get_full_steps())
+
+            if is_pass or t >= trials:
+                break
+
+            t += 1
+
+        final_result = result_list[-1]
+
+        return_full_result = return_full_result if return_full_result is not None else self.return_full_result
+        if return_full_result:
+            
+
+            for result in result_list:
+                token_usage += result.token_usage if result.token_usage else 0
+                step_dicts.extend()
+
+            # if self.memory.steps and isinstance(getattr(self.memory.steps[-1], "error", None), AgentMaxStepsError):
+            #     state = "max_steps_error"
+            # else:
+            # Think: add "max_trails_error" or not
+            state = "success"
+
+            return RunResult(
+                output=final_result.output,
+                token_usage=token_usage,
+                steps=step_dicts,
+                timing=Timing(start_time=run_start_time, end_time=time.time()),
+                state=state,
+            )
+
+        return final_result.output
+
+
+    def _step_stream(
+        self, memory_step: ActionStep
+    ) -> Generator[ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput]:
+        """
+        Perform one step in the ReAct framework: the agent thinks, acts, and observes the result.
+        Yields ChatMessageStreamDelta during the run if streaming is enabled.
+        At the end, yields either None if the step is not final, or the final answer.
+        """
+        memory_messages = self.write_memory_to_messages()
+
+        input_messages = memory_messages.copy()
+        ### Generate model output ###
+        memory_step.model_input_messages = input_messages
+        stop_sequences = ["Observation:", "Calling tools:"]
+        if self.code_block_tags[1] not in self.code_block_tags[0]:
+            # If the closing tag is contained in the opening tag, adding it as a stop sequence would cut short any code generation
+            stop_sequences.append(self.code_block_tags[1])
+        try:
+            additional_args: dict[str, Any] = {}
+            if self._use_structured_outputs_internally:
+                additional_args["response_format"] = CODEAGENT_RESPONSE_FORMAT
+            if self.stream_outputs:
+                output_stream = self.model.generate_stream(
+                    input_messages,
+                    stop_sequences=stop_sequences,
+                    **additional_args,
+                )
+                chat_message_stream_deltas: list[ChatMessageStreamDelta] = []
+                with Live("", console=self.logger.console, vertical_overflow="visible") as live:
+                    for event in output_stream:
+                        chat_message_stream_deltas.append(event)
+                        live.update(
+                            Markdown(agglomerate_stream_deltas(chat_message_stream_deltas).render_as_markdown())
+                        )
+                        yield event
+                chat_message = agglomerate_stream_deltas(chat_message_stream_deltas)
+                memory_step.model_output_message = chat_message
+                output_text = chat_message.content
+            else:
+                chat_message: ChatMessage = self.model.generate(
+                    input_messages,
+                    stop_sequences=stop_sequences,
+                    **additional_args,
+                )
+                memory_step.model_output_message = chat_message
+                output_text = chat_message.content
+                self.logger.log_markdown(
+                    content=output_text or "",
+                    title="Output message of the LLM:",
+                    level=LogLevel.DEBUG,
+                )
+
+            if not self._use_structured_outputs_internally:
+                # This adds the end code sequence (i.e. the closing code block tag) to the history.
+                # This will nudge subsequent LLM calls to finish with this end code sequence, thus efficiently stopping generation.
+                if output_text and not output_text.strip().endswith(self.code_block_tags[1]):
+                    output_text += self.code_block_tags[1]
+                    memory_step.model_output_message.content = output_text
+
+            memory_step.token_usage = chat_message.token_usage
+            memory_step.model_output = output_text
+        except Exception as e:
+            raise AgentGenerationError(f"Error in generating model output:\n{e}", self.logger) from e
+
+        ### Parse output ###
+        try:
+            if self._use_structured_outputs_internally:
+                code_action = json.loads(output_text)["code"]
+                code_action = extract_code_from_text(code_action, self.code_block_tags) or code_action
+            else:
+                code_action = parse_code_blobs(output_text, self.code_block_tags)
+            code_action = fix_final_answer_code(code_action)
+            memory_step.code_action = code_action
+        except Exception as e:
+            error_msg = f"Error in code parsing:\n{e}\nMake sure to provide correct code blobs."
+            raise AgentParsingError(error_msg, self.logger)
+
+        tool_call = ToolCall(
+            name="python_interpreter",
+            arguments=code_action,
+            id=f"call_{len(self.memory.steps)}",
+        )
+        yield tool_call
+        memory_step.tool_calls = [tool_call]
+
+        ### Execute action ###
+        self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO)
+        try:
+            code_output = self.python_executor(code_action)
+            execution_outputs_console = []
+            if len(code_output.logs) > 0:
+                execution_outputs_console += [
+                    Text("Execution logs:", style="bold"),
+                    Text(code_output.logs),
+                ]
+            observation = "Execution logs:\n" + code_output.logs
+        except Exception as e:
+            if hasattr(self.python_executor, "state") and "_print_outputs" in self.python_executor.state:
+                execution_logs = str(self.python_executor.state["_print_outputs"])
+                if len(execution_logs) > 0:
+                    execution_outputs_console = [
+                        Text("Execution logs:", style="bold"),
+                        Text(execution_logs),
+                    ]
+                    memory_step.observations = "Execution logs:\n" + execution_logs
+                    self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+            error_msg = str(e)
+            if "Import of " in error_msg and " is not allowed" in error_msg:
+                self.logger.log(
+                    "[bold red]Warning to user: Code execution failed due to an unauthorized import - Consider passing said import under `additional_authorized_imports` when initializing your CodeAgent.",
+                    level=LogLevel.INFO,
+                )
+            raise AgentExecutionError(error_msg, self.logger)
+
+        truncated_output = truncate_content(str(code_output.output))
+        observation += "Last output from code snippet:\n" + truncated_output
+        memory_step.observations = observation
+
+        if not code_output.is_final_answer:
+            execution_outputs_console += [
+                Text(
+                    f"Out: {truncated_output}",
+                ),
+            ]
+        self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+        memory_step.action_output = code_output.output
+        yield ActionOutput(output=code_output.output, is_final_answer=code_output.is_final_answer)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the agent to a dictionary representation.
+
+        Returns:
+            `dict`: Dictionary representation of the agent.
+        """
+        agent_dict = super().to_dict()
+        agent_dict["authorized_imports"] = self.authorized_imports
+        agent_dict["executor_type"] = self.executor_type
+        agent_dict["executor_kwargs"] = self.executor_kwargs
+        agent_dict["max_print_outputs_length"] = self.max_print_outputs_length
+        return agent_dict
+
+    @classmethod
+    def from_dict(cls, agent_dict: dict[str, Any], **kwargs) -> "CodeAgent":
+        """Create CodeAgent from a dictionary representation.
+
+        Args:
+            agent_dict (`dict[str, Any]`): Dictionary representation of the agent.
+            **kwargs: Additional keyword arguments that will override agent_dict values.
+
+        Returns:
+            `CodeAgent`: Instance of the CodeAgent class.
+        """
+        # Add CodeAgent-specific parameters to kwargs
+        code_agent_kwargs = {
+            "additional_authorized_imports": agent_dict.get("authorized_imports"),
+            "executor_type": agent_dict.get("executor_type"),
+            "executor_kwargs": agent_dict.get("executor_kwargs"),
+            "max_print_outputs_length": agent_dict.get("max_print_outputs_length"),
+            "code_block_tags": agent_dict.get("code_block_tags"),
+        }
+        # Filter out None values
+        code_agent_kwargs = {k: v for k, v in code_agent_kwargs.items() if v is not None}
+        # Update with any additional kwargs
+        code_agent_kwargs.update(kwargs)
+        # Call the parent class's from_dict method
+        return super().from_dict(agent_dict, **code_agent_kwargs)
+
 # Agent Registry for secure deserialization
 # This registry maps agent class names to their actual classes.
 # Only classes listed here can be instantiated during deserialization (from_dict/from_folder).
@@ -1811,4 +2232,5 @@ class CodeAgent(MultiStepAgent):
 AGENT_REGISTRY = {
     "ToolCallingAgent": ToolCallingAgent,
     "CodeAgent": CodeAgent,
+    "ReflexionAgent": ReflectionAgent,
 }
