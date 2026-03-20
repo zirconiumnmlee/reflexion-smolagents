@@ -78,6 +78,8 @@ from .monitoring import (
     TokenUsage,
 )
 from .remote_executors import BlaxelExecutor, DockerExecutor, E2BExecutor, ModalExecutor, WasmExecutor
+from .evaluator import evaluator
+from .self_reflection import self_reflection
 from .tools import BaseTool, Tool, validate_tool_arguments
 from .utils import (
     AgentError,
@@ -1840,8 +1842,10 @@ class ReflexionAgent(MultiStepAgent):
         stream_outputs: bool = False,
         use_structured_outputs_internally: bool = False,
         code_block_tags: str | tuple[str, str] | None = None,
+        trials: int = 5,
         **kwargs,
     ):
+        self.trials = trials
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.max_print_outputs_length = max_print_outputs_length
@@ -1968,7 +1972,7 @@ class ReflexionAgent(MultiStepAgent):
         additional_args: dict | None = None,
         max_steps: int | None = None,
         return_full_result: bool | None = None,
-        trials: int = 5,
+        return_reflection: bool | None = None
     ) -> Any | RunResult:
         """
         Run the agent for the given task with reflexion
@@ -2018,15 +2022,15 @@ class ReflexionAgent(MultiStepAgent):
 
             trajectory = result.steps
 
-            is_pass, reward = evaluator(trajectory)
+            is_pass, reward = evaluator(trajectory, model=self.model, task=task)
 
-            sr = self_reflection(trajectory, reward)
+            sr = self_reflection(trajectory, reward, model=self.model, task=task)
             reflection_mem.append(sr)
 
-            self.memory.reset()
             step_dicts.extend(self.memory.get_full_steps())
+            self.memory.reset()
 
-            if is_pass or t >= trials:
+            if is_pass or t >= self.trials:
                 break
 
             t += 1
@@ -2035,11 +2039,20 @@ class ReflexionAgent(MultiStepAgent):
 
         return_full_result = return_full_result if return_full_result is not None else self.return_full_result
         if return_full_result:
-            
-
+            total_input_tokens = 0
+            total_output_tokens = 0
+            correct_token_usage = True
             for result in result_list:
-                token_usage += result.token_usage if result.token_usage else 0
-                step_dicts.extend()
+                if result.token_usage is None:
+                    correct_token_usage = False
+                    break
+                else:
+                    total_input_tokens += result.token_usage.input_tokens
+                    total_output_tokens += result.token_usage.output_tokens
+            if correct_token_usage:
+                token_usage = TokenUsage(input_tokens=total_input_tokens, output_tokens=total_output_tokens)
+            else:
+                token_usage = None
 
             # if self.memory.steps and isinstance(getattr(self.memory.steps[-1], "error", None), AgentMaxStepsError):
             #     state = "max_steps_error"
@@ -2047,13 +2060,22 @@ class ReflexionAgent(MultiStepAgent):
             # Think: add "max_trails_error" or not
             state = "success"
 
-            return RunResult(
+            runresult = RunResult(
                 output=final_result.output,
                 token_usage=token_usage,
                 steps=step_dicts,
                 timing=Timing(start_time=run_start_time, end_time=time.time()),
                 state=state,
             )
+
+            return_reflection = return_reflection if return_reflection is not None else False
+            if return_reflection:
+                return {
+                    "runresult": runresult,
+                    "reflection": reflection_mem
+                }
+
+            return runresult
 
         return final_result.output
 
@@ -2232,5 +2254,5 @@ class ReflexionAgent(MultiStepAgent):
 AGENT_REGISTRY = {
     "ToolCallingAgent": ToolCallingAgent,
     "CodeAgent": CodeAgent,
-    "ReflexionAgent": ReflectionAgent,
+    "ReflexionAgent": ReflexionAgent,
 }

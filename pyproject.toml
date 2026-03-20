@@ -19,6 +19,8 @@ dependencies = [
   "pillow>=10.0.1",
   # Security fix for CVE-2023-4863: https://pillow.readthedocs.io/en/stable/releasenotes/10.0.1.html
   "python-dotenv",
+  "openinference-instrumentation>=0.1.46",
+  "arize-phoenix>=13.14.0",
 ]
 
 [project.optional-dependencies]
