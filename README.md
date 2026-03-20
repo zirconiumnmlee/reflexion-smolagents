@@ -1,3 +1,30 @@
+# Reflexion-SmolAgents
+
+<h3 align="center">
+  <div style="display:flex;flex-direction:row;">
+    <img src="img/reflexion-smolagents.png" alt="Hugging Face mascot as James Bond" width=400px>
+    <p>Smolagents that can slef-reflect!</p>
+  </div>
+</h3>
+
+This project extends smolagents with the Reflexion architecture, adding self-reflection capabilities based on language feedback.
+
+## Changes
+
+This project makes the following extensions to smolagents:
+
+- **ReflexionAgent**: Added `ReflexionAgent` class with self-reflection mechanism based on language feedback
+- **Evaluator**: Added `Evaluator` to judge the trajectory and output to give reward to agent
+- **Self-Reflection**: Added `Self-Reflection` to get experience based on trajectory and its reward under current task
+
+## TODO
+
+- [ ] Test scripts
+- [ ] Add various methods of `Evaluator`
+
+<details>
+<summary> <b>Original smolagents README</b></summary>
+
 <!---
 Copyright 2024 The HuggingFace Team. All rights reserved.
 
@@ -290,3 +317,5 @@ If you use `smolagents` in your publication, please cite it by using the followi
   year =         {2025}
 }
 ```
+
+</details>
